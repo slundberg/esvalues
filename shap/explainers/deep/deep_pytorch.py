@@ -107,7 +107,7 @@ class PyTorchDeepExplainer(Explainer):
             grads = [torch.autograd.grad(selected, x)[0].cpu().numpy() for x in X]
             return grads
 
-    def shap_values(self, X, ranked_outputs=None, output_rank_order="max"):
+    def shap_values(self, X, ranked_outputs=None, output_rank_order="max", ref_grad=None):
 
         # X ~ self.model_input
         # X_data ~ self.data

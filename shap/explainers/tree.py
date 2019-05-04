@@ -112,7 +112,7 @@ class TreeExplainer(Explainer):
             assert_import("xgboost")
             assert LooseVersion(xgboost.__version__) >= LooseVersion('0.81'), \
                 "A bug in XGBoost fixed in v0.81 makes XGBClassifier fail to give margin outputs! Please upgrade to XGBoost >= v0.81!"
-        
+
         # compute the expected value if we have a parsed tree for the cext
         if self.model_output == "logloss":
             self.expected_value = self.__dynamic_expected_value
@@ -128,7 +128,7 @@ class TreeExplainer(Explainer):
 
         return self.model.predict(self.data, np.ones(self.data.shape[0]) * y, output=self.model_output).mean(0)
         
-    def shap_values(self, X, y=None, tree_limit=None, approximate=False):
+    def shap_values(self, X, y=None, tree_limit=None, approximate=False, model_stack = False):
         """ Estimate the SHAP values for a set of samples.
 
         Parameters
@@ -157,7 +157,6 @@ class TreeExplainer(Explainer):
         attribute of the explainer when it is constant). For models with vector outputs this returns
         a list of such matrices, one for each output.
         """
-
         # see if we have a default tree_limit in place.
         if tree_limit is None:
             tree_limit = -1 if self.model.tree_limit is None else self.model.tree_limit
@@ -229,14 +228,18 @@ class TreeExplainer(Explainer):
  
         # run the core algorithm using the C extension
         assert_import("cext")
-        phi = np.zeros((X.shape[0], X.shape[1]+1, self.model.n_outputs))
+        if not model_stack:
+            phi = np.zeros((X.shape[0], X.shape[1]+1, self.model.n_outputs))
+        else:
+            # In this case, we are doing independent tree shap
+            phi = np.zeros((X.shape[0], X.shape[1]+1, self.model.n_outputs, self.data.shape[0]))
         if not approximate:
             _cext.dense_tree_shap(
                 self.model.children_left, self.model.children_right, self.model.children_default,
                 self.model.features, self.model.thresholds, self.model.values, self.model.node_sample_weight,
                 self.model.max_depth, X, X_missing, y, self.data, self.data_missing, tree_limit,
                 self.model.base_offset, phi, feature_dependence_codes[self.feature_dependence],
-                output_transform_codes[transform], False
+                output_transform_codes[transform], False, model_stack
             )
         else:
             _cext.dense_tree_saabas(
@@ -262,7 +265,7 @@ class TreeExplainer(Explainer):
             else:
                 return [phi[:, :-1, i] for i in range(self.model.n_outputs)]
 
-    def shap_interaction_values(self, X, y=None, tree_limit=None):
+    def shap_interaction_values(self, X, y=None, tree_limit=None, model_stack = False):
         """ Estimate the SHAP interaction values for a set of samples.
 
         Parameters
@@ -340,7 +343,7 @@ class TreeExplainer(Explainer):
             self.model.features, self.model.thresholds, self.model.values, self.model.node_sample_weight,
             self.model.max_depth, X, X_missing, y, self.data, self.data_missing, tree_limit,
             self.model.base_offset, phi, feature_dependence_codes[self.feature_dependence],
-            output_transform_codes[transform], True
+            output_transform_codes[transform], True, model_stack
         )
 
         # note we pull off the last column and keep it as our expected_value
@@ -452,11 +455,9 @@ class TreeEnsemble:
         elif str(type(model)).endswith("sklearn.ensemble.gradient_boosting.GradientBoostingRegressor'>"):
             self.dtype = np.float32
 
-            # currently we only support the mean and quantile estimators
+            # currently we only support the mean estimator
             if str(type(model.init_)).endswith("ensemble.gradient_boosting.MeanEstimator'>"):
                 self.base_offset = model.init_.mean
-            elif str(type(model.init_)).endswith("ensemble.gradient_boosting.QuantileEstimator'>"):
-                self.base_offset = model.init_.quantile
             else:
                 assert False, "Unsupported init model type: " + str(type(model.init_))
 
@@ -903,7 +904,7 @@ class Tree:
 
 
 
- 
+
 def get_xgboost_json(model):
     """ This gets a JSON dump of an XGBoost model while ensuring the features names are their indexes.
     """

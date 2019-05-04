@@ -168,6 +168,14 @@ class TFDeepExplainer(Explainer):
             else:
                 raise Exception("The model output tensor to be explained cannot have a static shape in dim 1 of None!")
 
+            # create placeholder for each output
+            self.grad_ys_t = [None]*noutputs
+            for output_ind in range(self.model_output.shape.as_list()[1]):
+                # get tensor placeholder representing the initial gradient
+                out = self.model_output[:,output_ind] if self.multi_output else self.model_output
+                self.grad_ys_t[output_ind] = tf.placeholder(out.dtype, shape=(None,))
+
+                
     def _variable_inputs(self, op):
         """ Return which inputs of this operation are variable (i.e. depend on the model inputs).
         """
@@ -175,7 +183,7 @@ class TFDeepExplainer(Explainer):
             self._vinputs[op.name] = np.array([t.op in self.between_ops or t in self.model_inputs for t in op.inputs])
         return self._vinputs[op.name]
 
-    def phi_symbolic(self, i):
+    def phi_symbolic(self, i, grad_ys = None):
         """ Get the SHAP value computation graph for a given model output.
         """
         if self.phi_symbolics[i] is None:
@@ -199,7 +207,11 @@ class TFDeepExplainer(Explainer):
             # define the computation graph for the attribution values using custom a gradient-like computation
             try:
                 out = self.model_output[:,i] if self.multi_output else self.model_output
-                self.phi_symbolics[i] = tf.gradients(out, self.model_inputs)
+                if grad_ys == None:
+                    self.phi_symbolics[i] = tf.gradients(out, self.model_inputs)
+                else:
+                    grad_ys_t = tf.placeholder(out.dtype, shape=(None,))
+                    self.phi_symbolics[i] = tf.gradients(out, self.model_inputs, grad_ys=self.grad_ys_t[i])
 
             finally:
 
@@ -213,8 +225,42 @@ class TFDeepExplainer(Explainer):
                         reg[n]["type"] = self.orig_grads[n]
         return self.phi_symbolics[i]
 
-    def shap_values(self, X, ranked_outputs=None, output_rank_order="max"):
+    def shap_values(self, X, ranked_outputs=None, output_rank_order="max", ref_grad=None):
+        """ Return approximate SHAP values for the model applied to the data given by X.
 
+        Parameters
+        ----------
+        X : list, numpy.array, or pandas.DataFrame
+            A tensor (or list of tensors) of samples (where X.shape[0] == # samples) on which to
+            explain the model's output.
+
+        ranked_outputs : None or int
+            If ranked_outputs is None then we explain all the outputs in a multi-output model. If
+            ranked_outputs is a positive integer then we only explain that many of the top model
+            outputs (where "top" is determined by output_rank_order). Note that this causes a pair
+            of values to be returned (shap_values, indexes), where shap_values is a list of numpy
+            arrays for each of the output ranks, and indexes is a matrix that indicates for each sample
+            which output indexes were choses as "top".
+
+        output_rank_order : "max", "min", or "max_abs"
+            How to order the model outputs when using ranked_outputs, either by maximum, minimum, or
+            maximum absolute value.
+                        
+        ref_grad : 
+            Used for model stacking.  Expects a numpy array of shape (N, M, O) where N is the number
+            of foreground samples, M is the number of background references, and O is the number of
+            outputs (hidden layer).
+
+        Returns
+        -------
+        For a models with a single output this returns a tensor of SHAP values with the same shape
+        as X. For a model with multiple outputs this returns a list of SHAP value tensors, each of
+        which are the same shape as X. If ranked_outputs is None then this list of tensors matches
+        the number of model outputs. If ranked_outputs is a positive integer a pair is returned
+        (shap_values, indexes), where shap_values is a list of tensors with a length of
+        ranked_outputs, and indexes is a matrix that indicates for each sample which output indexes
+        were chosen as "top".
+        """        
         # check if we have multiple inputs
         if not self.multi_input:
             if type(X) == list and len(X) != 1:
@@ -242,30 +288,10 @@ class TFDeepExplainer(Explainer):
 
         # compute the attributions
         output_phis = []
-        for i in range(model_output_ranks.shape[1]):
-            phis = []
-            for k in range(len(X)):
-                phis.append(np.zeros(X[k].shape))
-            for j in range(X[0].shape[0]):
-                if (hasattr(self.data, '__call__')):
-                    bg_data = self.data([X[l][j] for l in range(len(X))])
-                    if type(bg_data) != list:
-                        bg_data = [bg_data]
-                else:
-                    bg_data = self.data
-                # tile the inputs to line up with the background data samples
-                tiled_X = [np.tile(X[l][j:j+1], (bg_data[l].shape[0],) + tuple([1 for k in range(len(X[l].shape)-1)])) for l in range(len(X))]
-                # we use the first sample for the current sample and the rest for the references
-                joint_input = [np.concatenate([tiled_X[l], bg_data[l]], 0) for l in range(len(X))]
-                # run attribution computation graph
-                feature_ind = model_output_ranks[j,i]
-                sample_phis = self.run(self.phi_symbolic(feature_ind), self.model_inputs, joint_input)
-
-                # assign the attributions to the right part of the output arrays
-                for l in range(len(X)):
-                    phis[l][j] = (sample_phis[l][bg_data[l].shape[0]:] * (X[l][j] - bg_data[l])).mean(0)
-
+        for i in range(model_output_ranks.shape[1]): # index of current model output
+            phis = self.compute_single_output(X, model_output_ranks, i, ref_grad)
             output_phis.append(phis[0] if not self.multi_input else phis)
+
         if not self.multi_output:
             return output_phis[0]
         elif ranked_outputs is not None:
@@ -273,6 +299,45 @@ class TFDeepExplainer(Explainer):
         else:
             return output_phis
 
+    def compute_single_output(self, X, model_output_ranks, i, ref_grad = None):
+        # Set the starting gradient (for model stacking)
+        grad_ys = None
+        if ref_grad is not None:
+            noutputs = self.model_output.shape.as_list()[1]
+            # starting gradient for the x's are just zero
+            grad_ys = (np.zeros((X[0].shape[0],noutputs)), ref_grad)
+
+        phis = []
+        for k in range(len(X)):
+            phis.append(np.zeros(X[k].shape))
+        for j in range(X[0].shape[0]): # index of current sample being explained
+
+            # tile the inputs to line up with the background data samples
+            tiled_X = [np.tile(X[l][j:j+1], (self.data[l].shape[0],) + tuple([1 for k in range(len(X[l].shape)-1)])) for l in range(len(X))]
+            # we use the first sample for the current sample and the rest for the references
+            joint_input = [np.concatenate([tiled_X[l], self.data[l]], 0) for l in range(len(X))]
+
+            feature_ind = model_output_ranks[j,i]
+            # run attribution computation graph
+            if grad_ys is None:                
+                sample_phis = self.run(self.phi_symbolic(feature_ind), self.model_inputs, joint_input)
+            else:
+                x_gys, data_gys = grad_ys
+                data_gys = data_gys[:,:,j] # select the current sample
+                tiled_grad_ys = np.tile(x_gys[j:j+1,i], data_gys.shape[0])
+                joint_grad_ys = [np.concatenate([tiled_grad_ys, data_gys[:,i]])]
+                #print("[DEBUG] joint_grad_ys.shape {}".format(joint_grad_ys.shape))
+                
+                sample_phis = self.run(self.phi_symbolic(feature_ind, grad_ys), 
+                                       self.model_inputs+[self.grad_ys_t[feature_ind]], 
+                                       joint_input+joint_grad_ys)
+
+            # assign the attributions to the right part of the output arrays
+            for l in range(len(X)):
+                phis[l][j] = (sample_phis[l][self.data[l].shape[0]:] * (X[l][j] - self.data[l])).mean(0)
+            
+        return(phis)
+        
     def run(self, out, model_inputs, X):
         """ Runs the model while also setting the learning phase flags to False.
         """
@@ -285,7 +350,6 @@ class TFDeepExplainer(Explainer):
         """ Passes a gradient op creation request to the correct handler.
         """
         return op_handlers[op.type](self, op, *grads)
-
 
 def tensors_blocked_by_false(ops):
     """ Follows a set of ops assuming their value is False and find blocked Switch paths.

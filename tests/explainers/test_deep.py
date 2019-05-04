@@ -183,7 +183,62 @@ def test_keras_imdb_lstm():
     diff = sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: testx})[0,:] - \
         sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: background}).mean(0)
     assert np.allclose(sums, diff, atol=1e-06), "Sum of SHAP values does not match difference!"
+    
+def test_model_stack_keras_xgb():
+    try:
+        import xgboost
+        from keras.models import Sequential, load_model
+        from keras.layers import Dense, LSTM, Dropout, Activation
+    except Exception as e:
+        print("Skipping test_model_stack_keras_xgb!")
+        return
+    import shap
+    n = 100
+    m = 100
+    np.random.seed(10)
+    model = Sequential()
+    model.add(Dense(64, activation='relu', input_dim=m))
+    model.add(Dropout(0.5))
+    model.add(Dense(10, activation='softmax'))
 
+    # Encountered an error where I needed to set learning phase before, so I will leave this here
+    # from keras import backend as K
+    # K.set_learning_phase(0)
+
+    X = np.random.normal(size=(n,m))
+    y = np.random.normal(size=(n,1))
+    X_embed = model.predict(X)
+
+    # Set up explainer objects
+    tree_model = xgboost.train({'eta':1, 'silent':1, 'base_score': 0, }, xgboost.DMatrix(X_embed, label=y), 10)
+    tree_expl = shap.TreeExplainer(tree_model, X_embed, feature_dependence="independent")
+    e = shap.DeepExplainer(model, X)
+
+    x_embed = X_embed[0:10]
+    x       = X[0:10]
+
+    # Obtain single reference shap values for tree
+    itshap_ms = tree_expl.shap_values(x_embed, model_stack = True)
+
+    # Rescale shap values to get gradient
+    num_references = X_embed.shape[0]
+    num_samples    = x_embed.shape[0]
+    x_embed2 = np.transpose(x_embed)[np.newaxis,:,:]
+    x_embed2 = np.repeat(x_embed2,num_references,axis=0)
+    X_embed2 = X_embed[:,:,np.newaxis]
+    X_embed2 = np.repeat(X_embed2,num_samples,axis=2)
+    numer    = np.transpose(itshap_ms)
+    denom    = x_embed2 - X_embed2
+    ref_grad = np.divide(numer, denom, out=np.zeros_like(numer), where=denom!=0)
+
+    # Make sure intermediary attributions sum up correctly
+    y_pred = tree_model.predict(xgboost.DMatrix(x_embed))
+    assert np.max(itshap_ms.mean(2).sum(1) - (y_pred - tree_expl.expected_value.mean())) < .0001
+
+    # Make sure stacked attributions sum up correctly
+    phi_final = np.array(e.shap_values(x, ref_grad=ref_grad))
+    assert np.max(itshap_ms.mean(2).sum(1) - phi_final.sum(0).sum(1)) < .0001
+    
 def test_tf_keras_imdb_lstm():
     """ Basic LSTM example using the keras API defined in tensorflow
     """
