@@ -17,7 +17,8 @@ from . import colors
 # TODO: remove unused title argument / use title argument
 def summary_plot(shap_values, features=None, feature_names=None, max_display=None, plot_type=None,
                  color=None, axis_color="#333333", title=None, alpha=1, show=True, sort=True,
-                 color_bar=True, auto_size_plot=True, layered_violin_max_num_bins=20, class_names=None):
+                 color_bar=True, auto_size_plot=True, layered_violin_max_num_bins=20, class_names=None,
+                 export_path=None, width=8):
     """Create a SHAP summary plot, colored by feature values when they are provided.
 
     Parameters
@@ -131,6 +132,8 @@ def summary_plot(shap_values, features=None, feature_names=None, max_display=Non
             pl.title(shorten_text(feature_names[ind], title_length_limit))
         pl.tight_layout(pad=0, w_pad=0, h_pad=0.0)
         pl.subplots_adjust(hspace=0, wspace=0.1)
+        if export_path:
+            pl.savefig(export_path)
         if show:
             pl.show()
         return
@@ -150,7 +153,7 @@ def summary_plot(shap_values, features=None, feature_names=None, max_display=Non
 
     row_height = 0.4
     if auto_size_plot:
-        pl.gcf().set_size_inches(8, len(feature_order) * row_height + 1.5)
+        pl.gcf().set_size_inches(width, len(feature_order) * row_height + 1.5)
     pl.axvline(x=0, color="#999999", zorder=-1)
 
     if plot_type == "dot":
@@ -410,6 +413,8 @@ def summary_plot(shap_values, features=None, feature_names=None, max_display=Non
         pl.xlabel(labels['GLOBAL_VALUE'], fontsize=13)
     else:
         pl.xlabel(labels['VALUE'], fontsize=13)
+    if export_path:
+        pl.savefig(export_path)
     if show:
         pl.show()
 
