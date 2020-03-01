@@ -4,8 +4,13 @@ import numpy as np
 import nose
 import os
 
+from tests.fixtures import set_seed
+from nose.tools import with_setup
+
+
 # force us to not use any GPUs since running many tests may cause trouble
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 
 def _skip_if_no_tensorflow():
     try:
@@ -19,6 +24,7 @@ def _skip_if_no_pytorch():
         import torch
     except ImportError:
         raise nose.SkipTest('Pytorch not installed.')
+
 
 def test_tf_eager():
     """ This is a basic eager example from keras.
@@ -130,7 +136,7 @@ def test_tf_keras_linear():
     """Test verifying that a linear model with linear data gives the correct result.
     """
     _skip_if_no_tensorflow()
-    
+
     from tensorflow.keras.models import Model
     from tensorflow.keras.layers import Dense, Input
     from tensorflow.keras.optimizers import SGD
@@ -227,6 +233,8 @@ def test_tf_keras_imdb_lstm():
         sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: background}).mean(0)
     assert np.allclose(sums, diff, atol=1e-02), "Sum of SHAP values does not match difference!"
 
+
+@with_setup(set_seed)
 def test_pytorch_mnist_cnn():
     """The same test as above, but for pytorch
     """
@@ -238,7 +246,7 @@ def test_pytorch_mnist_cnn():
     from torch.nn import functional as F
     import shap
 
-    def run_test(train_loader, test_loader, interim):
+    def run_test(train_loader, test_loader, interim, device):
 
         class Net(nn.Module):
             def __init__(self):
@@ -279,7 +287,7 @@ def test_pytorch_mnist_cnn():
                 data, target = data.to(device), target.to(device)
                 optimizer.zero_grad()
                 output = model(data)
-                loss = F.mse_loss(output, torch.eye(10)[target])
+                loss = F.mse_loss(output, torch.eye(10)[target].to(device))
                 # loss = F.nll_loss(output, target)
                 loss.backward()
                 optimizer.step()
@@ -290,25 +298,31 @@ def test_pytorch_mnist_cnn():
                 if num_examples > cutoff:
                     break
 
-        device = torch.device('cpu')
-        train(model, device, train_loader, optimizer, 1)
+        train(model.to(device), device, train_loader, optimizer, 1)
 
         next_x, next_y = next(iter(train_loader))
         np.random.seed(0)
         inds = np.random.choice(next_x.shape[0], 20, replace=False)
         if interim:
-            e = shap.DeepExplainer((model, model.conv_layers[0]), next_x[inds, :, :, :])
+            e = shap.DeepExplainer(
+                (model.to(device), model.conv_layers[0].to(device)), next_x[inds, :, :, :].to(device)
+            )
         else:
-            e = shap.DeepExplainer(model, next_x[inds, :, :, :])
+            e = shap.DeepExplainer(
+                model.to(device), next_x[inds, :, :, :].to(device)
+            )
         test_x, test_y = next(iter(test_loader))
         input_tensor = test_x[:1]
         input_tensor.requires_grad = True
-        shap_values = e.shap_values(input_tensor)
+        shap_values = e.shap_values(input_tensor.to(device))
 
+        model = model.to(device)
         model.eval()
         model.zero_grad()
         with torch.no_grad():
-            diff = (model(test_x[:1]) - model(next_x[inds, :, :, :])).detach().numpy().mean(0)
+            test_outputs = model(test_x[:1].to(device))
+            next_outputs = model(next_x[inds, :].to(device))
+            diff = (test_outputs - next_outputs).detach().cpu().numpy().mean(0)
         sums = np.array([shap_values[i].sum() for i in range(len(shap_values))])
         d = np.abs(sums - diff).sum()
         assert d / np.abs(diff).sum() < 0.001, "Sum of SHAP values does not match difference! %f" % (
@@ -332,14 +346,20 @@ def test_pytorch_mnist_cnn():
                        ])),
         batch_size=batch_size, shuffle=True)
 
-    print ('Running test on interim layer')
-    run_test(train_loader, test_loader, interim=True)
-    print ('Running test on whole model')
-    run_test(train_loader, test_loader, interim=False)
+    print('Running test on interim layer')
+    run_test(train_loader, test_loader, interim=True, device="cpu")
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = 0
+        run_test(train_loader, test_loader, interim=True, device="cuda:0")
+    print('Running test on whole model')
+    run_test(train_loader, test_loader, interim=False, device="cpu")
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = 0
+        run_test(train_loader, test_loader, interim=True, device="cuda:0")
     # clean up
     shutil.rmtree(root_dir)
 
-
+@with_setup(set_seed)
 def test_pytorch_single_output():
     """Testing single outputs
     """
@@ -352,76 +372,85 @@ def test_pytorch_single_output():
     from sklearn.datasets import load_boston
     import shap
 
+    def run_test(loader, device):
+        class Net(nn.Module):
+            def __init__(self, num_features):
+                super(Net, self).__init__()
+                self.linear = nn.Linear(num_features // 2, 2)
+                self.conv1d = nn.Conv1d(1, 1, 1)
+                self.convt1d = nn.ConvTranspose1d(1, 1, 1)
+                self.leaky_relu = nn.LeakyReLU()
+                self.aapool1d = nn.AdaptiveAvgPool1d(output_size=6)
+                self.maxpool2 = nn.MaxPool1d(kernel_size=2)
+
+            def forward(self, X):
+                x = self.aapool1d(self.convt1d(self.conv1d(X.unsqueeze(1)))).squeeze(1)
+                return self.maxpool2(self.linear(self.leaky_relu(x)).unsqueeze(1)).squeeze(1)
+        model = Net(num_features)
+        optimizer = torch.optim.Adam(model.parameters())
+
+        def train(model, device, train_loader, optimizer, epoch):
+            model.train()
+            num_examples = 0
+            for batch_idx, (data, target) in enumerate(train_loader):
+                num_examples += target.shape[0]
+                data, target = data.to(device), target.to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = F.mse_loss(output.squeeze(1), target)
+                loss.backward()
+                optimizer.step()
+                if batch_idx % 2 == 0:
+                    print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                        epoch, batch_idx * len(data), len(train_loader.dataset),
+                               100. * batch_idx / len(train_loader), loss.item()))
+
+        train(model.to(device), device, loader, optimizer, 1)
+
+        next_x, next_y = next(iter(loader))
+        np.random.seed(0)
+        inds = np.random.choice(next_x.shape[0], 20, replace=False)
+        e = shap.DeepExplainer(model.to(device), next_x[inds, :].to(device))
+        test_x, test_y = next(iter(loader))
+        shap_values = e.shap_values(test_x[:1].to(device))
+
+        model = model.to(device)
+        model.eval()
+        model.zero_grad()
+        with torch.no_grad():
+            test_outputs = model(test_x[:1].to(device))
+            next_outputs = model(next_x[inds, :].to(device))
+            diff = (test_outputs - next_outputs).detach().cpu().numpy().mean(0)
+        sums = np.array([shap_values[i].sum() for i in range(len(shap_values))])
+        d = np.abs(sums - diff).sum()
+        assert d / np.abs(diff).sum() < 0.001, "Sum of SHAP values does not match difference! %f" % (
+                d / np.abs(diff).sum())
+
     X, y = load_boston(return_X_y=True)
     num_features = X.shape[1]
     data = TensorDataset(torch.tensor(X).float(),
                          torch.tensor(y).float())
     loader = DataLoader(data, batch_size=128)
 
-    class Net(nn.Module):
-        def __init__(self, num_features):
-            super(Net, self).__init__()
-            self.linear = nn.Linear(num_features // 2, 2)
-            self.conv1d = nn.Conv1d(1, 1, 1)
-            self.convt1d = nn.ConvTranspose1d(1, 1, 1)
-            self.leaky_relu = nn.LeakyReLU()
-            self.aapool1d = nn.AdaptiveAvgPool1d(output_size=6)
-            self.maxpool2 = nn.MaxPool1d(kernel_size=2)
+    run_test(loader, device="cpu")
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = 0
+        run_test(loader, device="cuda:0")
 
-        def forward(self, X):
-            x = self.aapool1d(self.convt1d(self.conv1d(X.unsqueeze(1)))).squeeze(1)
-            return self.maxpool2(self.linear(self.leaky_relu(x)).unsqueeze(1)).squeeze(1)
-    model = Net(num_features)
-    optimizer = torch.optim.Adam(model.parameters())
-
-    def train(model, device, train_loader, optimizer, epoch):
-        model.train()
-        num_examples = 0
-        for batch_idx, (data, target) in enumerate(train_loader):
-            num_examples += target.shape[0]
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.mse_loss(output.squeeze(1), target)
-            loss.backward()
-            optimizer.step()
-            if batch_idx % 2 == 0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                    epoch, batch_idx * len(data), len(train_loader.dataset),
-                           100. * batch_idx / len(train_loader), loss.item()))
-
-    device = torch.device('cpu')
-    train(model, device, loader, optimizer, 1)
-
-    next_x, next_y = next(iter(loader))
-    np.random.seed(0)
-    inds = np.random.choice(next_x.shape[0], 20, replace=False)
-    e = shap.DeepExplainer(model, next_x[inds, :])
-    test_x, test_y = next(iter(loader))
-    shap_values = e.shap_values(test_x[:1])
-
-    model.eval()
-    model.zero_grad()
-    with torch.no_grad():
-        diff = (model(test_x[:1]) - model(next_x[inds, :])).detach().numpy().mean(0)
-    sums = np.array([shap_values[i].sum() for i in range(len(shap_values))])
-    d = np.abs(sums - diff).sum()
-    assert d / np.abs(diff).sum() < 0.001, "Sum of SHAP values does not match difference! %f" % (
-            d / np.abs(diff).sum())
-
-
+@with_setup(set_seed)
 def test_pytorch_multiple_inputs():
     _skip_if_no_pytorch()
 
-    def _run_pytorch_multiple_inputs_test(disconnected):
+    import torch
+    from torch import nn
+    from torch.nn import functional as F
+    from torch.utils.data import TensorDataset, DataLoader
+    from sklearn.datasets import load_boston
+    import shap
+
+    def _run_pytorch_multiple_inputs_test(disconnected, device):
         """Testing multiple inputs
         """
-        import torch
-        from torch import nn
-        from torch.nn import functional as F
-        from torch.utils.data import TensorDataset, DataLoader
-        from sklearn.datasets import load_boston
-        import shap
 
         X, y = load_boston(return_X_y=True)
         num_features = X.shape[1]
@@ -470,25 +499,29 @@ def test_pytorch_multiple_inputs():
                         epoch, batch_idx * len(data), len(train_loader.dataset),
                                100. * batch_idx / len(train_loader), loss.item()))
 
-        device = torch.device('cpu')
-        train(model, device, loader, optimizer, 1)
+        train(model.to(device), device, loader, optimizer, 1)
 
         next_x1, next_x2, next_y = next(iter(loader))
         np.random.seed(0)
         inds = np.random.choice(next_x1.shape[0], 20, replace=False)
-        background = [next_x1[inds, :], next_x2[inds, :]]
-        e = shap.DeepExplainer(model, background)
+        background = [next_x1[inds, :].to(device), next_x2[inds, :].to(device)]
+        e = shap.DeepExplainer(model.to(device), background)
         test_x1, test_x2, test_y = next(iter(loader))
-        shap_x1, shap_x2 = e.shap_values([test_x1[:1], test_x2[:1]])
+        shap_x1, shap_x2 = e.shap_values([test_x1[:1].to(device), test_x2[:1].to(device)])
 
+        model = model.to(device)
         model.eval()
         model.zero_grad()
         with torch.no_grad():
-            diff = (model(test_x1[:1], test_x2[:1]) - model(*background)).detach().numpy().mean(0)
+            test_outputs = model(test_x1[:1].to(device), test_x2[:1].to(device))
+            next_outputs = model(*[b.to(device) for b in background])
+            diff = (test_outputs - next_outputs).detach().cpu().numpy().mean(0)
         sums = np.array([shap_x1[i].sum() + shap_x2[i].sum() for i in range(len(shap_x1))])
         d = np.abs(sums - diff).sum()
         assert d / np.abs(diff).sum() < 0.001, "Sum of SHAP values does not match difference! %f" % (
                 d / np.abs(diff).sum())
 
-    _run_pytorch_multiple_inputs_test(disconnected=True)
-    _run_pytorch_multiple_inputs_test(disconnected=False)
+    _run_pytorch_multiple_inputs_test(disconnected=True, device="cpu")
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = 0
+        _run_pytorch_multiple_inputs_test(disconnected=False, device="cuda:0")
