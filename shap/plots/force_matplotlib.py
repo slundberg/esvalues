@@ -408,4 +408,7 @@ def draw_additive_plot(data, figsize, show, text_rotation=0):
         plt.show()
     else:
         return plt.gcf()
+
+    return fig, ax
+
     
