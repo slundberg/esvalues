@@ -140,6 +140,9 @@ class TreeExplainer:
     """
 
     def __init__(self, model, **kwargs):
+        if kwargs:
+            raise TypeError("Unused keyword arguments: " + ", ".join(kwargs.keys()))
+
         self.model_type = "internal"
 
         if str(type(model)).endswith("sklearn.ensemble.forest.RandomForestRegressor'>"):
@@ -165,6 +168,8 @@ class TreeExplainer:
             self.pweights = np.zeros(s, dtype=np.float64)
 
     def shap_values(self, X, tree_limit=-1, **kwargs):
+        if kwargs:
+            raise TypeError("Unused keyword arguments: " + ", ".join(kwargs.keys()))
 
         # shortcut using the C++ version of Tree SHAP in XGBoost and LightGBM
         # these are about 10x faster than the numba jit'd implementation below...
@@ -217,6 +222,8 @@ class TreeExplainer:
                 return [phi[:, :, i] for i in range(n_outputs)]
 
     def shap_interaction_values(self, X, tree_limit=-1, **kwargs):
+        if kwargs:
+            raise TypeError("Unused keyword arguments: " + ", ".join(kwargs.keys()))
 
         # shortcut using the C++ version of Tree SHAP in XGBoost and LightGBM
         if self.model_type == "xgboost":
