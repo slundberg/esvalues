@@ -33,7 +33,8 @@ output_transform_codes = {
     "identity": 0,
     "logistic": 1,
     "logistic_nlogloss": 2,
-    "squared_loss": 3
+    "squared_loss": 3,
+    "log_link":4
 }
 
 feature_perturbation_codes = {
@@ -567,6 +568,7 @@ class TreeEnsemble:
             "friedman_mse": "squared_error",
             "reg:linear": "squared_error",
             "reg:squarederror": "squared_error",
+            "reg:tweedie": "log_link",
             "regression": "squared_error",
             "regression_l2": "squared_error",
             "mae": "absolute_error",
@@ -583,6 +585,7 @@ class TreeEnsemble:
             "regression_l2": "squared_error",
             "reg:linear": "raw_value",
             "reg:squarederror": "raw_value",
+            "reg:tweedie": "log_link",
             "reg:logistic": "log_odds",
             "binary:logistic": "log_odds",
             "binary_logloss": "log_odds",
@@ -1029,6 +1032,9 @@ class TreeEnsemble:
                 transform = "logistic_nlogloss"
             else:
                 raise Exception("model_output = \"log_loss\" is not yet supported when model.objective = \"" + self.objective + "\"!")
+        elif self.model_output == "log_link":
+
+                transform = "log_link"
         else:
             raise Exception("Unrecognized model_output parameter value: %s! If model.%s is a valid function open a github issue to ask that this method be supported. If you want 'predict_proba' just use 'probability' for now." % (str(self.model_output), str(self.model_output)))
 
