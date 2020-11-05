@@ -44,22 +44,18 @@ feature_perturbation_codes = {
 
 class Tree(Explainer):
     """Uses Tree SHAP algorithms to explain the output of ensemble tree models.
-
     Tree SHAP is a fast and exact method to estimate SHAP values for tree models and ensembles of trees,
     under several different possible assumptions about feature dependence. It depends on fast C++
     implementations either inside an externel model package or in the local compiled C extention.
-
     Parameters
     ----------
     model : model object
         The tree based machine learning model that we want to explain. XGBoost, LightGBM, CatBoost, Pyspark
         and most tree-based scikit-learn models are supported.
-
     data : numpy.array or pandas.DataFrame
         The background dataset to use for integrating out features. This argument is optional when
         feature_perturbation="tree_path_dependent", since in that case we can use the number of training
         samples that went down each tree path as our background dataset (this is recorded in the model object).
-
     feature_perturbation : "interventional" (default) or "tree_path_dependent" (default when data=None)
         Since SHAP values rely on conditional expectations we need to decide how to handle correlated
         (or otherwise dependent) input features. The "interventional" approach breaks the dependencies between
@@ -69,7 +65,6 @@ class Tree(Explainer):
         sizes to use. The "tree_path_dependent" approach is to just follow the trees and use the number
         of training examples that went down each leaf to represent the background distribution. This approach
         does not require a background dataset and so is used by default when no background dataset is provided.
-
     model_output : "raw", "probability", "log_loss", or model method name
         What output of the model should be explained. If "raw" then we explain the raw output of the
         trees, which varies by model. For regression models "raw" is the standard output, for binary
@@ -81,7 +76,6 @@ class Tree(Explainer):
         then we explain the log base e of the model loss function, so that the SHAP values sum up to the
         log loss of the model for each sample. This is helpful for breaking down model performance by feature.
         Currently the probability and logloss options are only supported when feature_dependence="independent".
-
     Examples
     --------
     See :ref:`Tree Explainer Examples <tree_explainer_examples>`
@@ -224,30 +218,24 @@ class Tree(Explainer):
 
     def shap_values(self, X, y=None, tree_limit=None, approximate=False, check_additivity=True, from_call=False):
         """ Estimate the SHAP values for a set of samples.
-
         Parameters
         ----------
         X : numpy.array, pandas.DataFrame or catboost.Pool (for catboost)
             A matrix of samples (# samples x # features) on which to explain the model's output.
-
         y : numpy.array
             An array of label values for each sample. Used when explaining loss functions.
-
         tree_limit : None (default) or int
             Limit the number of trees used by the model. By default None means no use the limit of the
             original model, and -1 means no limit.
-
         approximate : bool
             Run fast, but only roughly approximate the Tree SHAP values. This runs a method
             previously proposed by Saabas which only considers a single feature ordering. Take care
             since this does not have the consistency guarantees of Shapley values and places too
             much weight on lower splits in the tree.
-
         check_additivity : bool
             Run a validation check that the sum of the SHAP values equals the output of the model. This
             check takes only a small amount of time, and will catch potential unforeseen errors.
             Note that this check only runs right now when explaining the margin of the model.
-
         Returns
         -------
         array or list
@@ -402,19 +390,15 @@ class Tree(Explainer):
 
     def shap_interaction_values(self, X, y=None, tree_limit=None):
         """ Estimate the SHAP interaction values for a set of samples.
-
         Parameters
         ----------
         X : numpy.array, pandas.DataFrame or catboost.Pool (for catboost)
             A matrix of samples (# samples x # features) on which to explain the model's output.
-
         y : numpy.array
             An array of label values for each sample. Used when explaining loss functions (not yet supported).
-
         tree_limit : None (default) or int
             Limit the number of trees used by the model. By default None means no use the limit of the
             original model, and -1 means no limit.
-
         Returns
         -------
         array or list
@@ -523,7 +507,6 @@ class Tree(Explainer):
     @staticmethod
     def supports_model_with_masker(model, masker):
         """ Determines if this explainer can handle the given model.
-
         This is an abstract static method meant to be implemented by each subclass.
         """
 
@@ -539,7 +522,6 @@ class Tree(Explainer):
 
 class TreeEnsemble:
     """ An ensemble of decision trees.
-
     This object provides a common interface to many different types of models.
     """
 
@@ -758,6 +740,18 @@ class TreeEnsemble:
 
             self.trees = [SingleTree(e.tree_, scaling=model.learning_rate, data=data, data_missing=data_missing) for e in model.estimators_[:,0]]
             self.objective = objective_name_map.get(model.criterion, None)
+        ### Added AdaBoostClassifier based on the outdated StackOverflow response and Github issue here
+        ### https://stackoverflow.com/questions/60433389/how-to-calculate-shap-values-for-adaboost-model/61108156#61108156
+        ### https://github.com/slundberg/shap/issues/335
+        elif safe_isinstance(model, ["sklearn.ensemble.AdaBoostClassifier","sklearn.ensemble._weighted_boosting.AdaBoostClassifier"]):
+            assert hasattr(model, "estimators_"), "Model has no `estimators_`! Have you called `model.fit`?"
+            self.internal_dtype = model.estimators_[0].tree_.value.dtype.type
+            self.input_dtype = np.float32
+            scaling = 1.0 / len(model.estimators_) # output is average of trees
+            self.trees = [SingleTree(e.tree_, normalize=True, scaling=scaling) for e in model.estimators_]
+            self.objective = objective_name_map.get(model.base_estimator_.criterion, None) #This line is done to get the decision criteria, for example gini.
+            self.tree_output = "probability" #This is the last line added
+        
         elif "pyspark.ml" in str(type(model)):
             assert_import("pyspark")
             self.model_type = "pyspark"
@@ -1036,7 +1030,6 @@ class TreeEnsemble:
 
     def predict(self, X, y=None, output=None, tree_limit=None):
         """ A consistent interface to make predictions from this model.
-
         Parameters
         ----------
         tree_limit : None (default) or int
@@ -1102,7 +1095,6 @@ class TreeEnsemble:
 
 class SingleTree:
     """ A single decision tree.
-
     The primary point of this object is to parse many different tree types into a common format.
     """
     def __init__(self, tree, normalize=False, scaling=1.0, data=None, data_missing=None):
@@ -1390,7 +1382,6 @@ def get_xgboost_json(model):
 
 class XGBTreeModelLoader(object):
     """ This loads an XGBoost model directly from a raw memory dump.
-
     We can't use the JSON dump because due to numerical precision issues those
     tree can actually be wrong when feature values land almost on a threshold.
     """
@@ -1636,4 +1627,3 @@ class CatBoostTreeModelLoader:
                             }, data=data, data_missing=data_missing))
 
         return trees
-
