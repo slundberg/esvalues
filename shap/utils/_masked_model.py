@@ -14,13 +14,15 @@ class MaskedModel():
 
     delta_mask_noop_value = 2147483647 # used to encode a noop for delta masking
 
-    def __init__(self, model, masker, link, *args):
+    def __init__(self, model, masker, link, *args, **kwargs):
         self.model = model
         self.masker = masker
         self.link = link
         self.args = args
+        self.mode = kwargs.get("mode")
+        self.ps_len = kwargs.get("ps_len", -1)        
         # if the masker supports it, save what positions vary from the background
-        if callable(getattr(self.masker, "invariants", None)):
+        if callable(getattr(self.masker, "invariants", None)) and (self.mode != 'full'):
             self._variants = ~self.masker.invariants(*args)
             self._variants_column_sums = self._variants.sum(0)
             self._variants_row_inds = [
@@ -43,24 +45,25 @@ class MaskedModel():
             self._masker_rows = None# # just assuming...
             self._masker_cols = sum(np.prod(a.shape) for a in self.args)
 
-    def __call__(self, masks, batch_size=None):
+    def __call__(self, masks, batch_size=None, ps_len=-1, start_row = 0):
 
+        self.ps_len = ps_len
         # if we are passed a 1D array of indexes then we are delta masking and have a special implementation
         if len(masks.shape) == 1:
             if getattr(self.masker, "supports_delta_masking", False):
-                return self._delta_masking_call(masks, batch_size=batch_size)
+                return self._delta_masking_call(masks, batch_size=batch_size, start_row = start_row)
 
             # we need to convert from delta masking to a full masking call because we were given a delta masking
             # input but the masker does not support delta masking
             else: 
                 full_masks = np.zeros((int(np.sum(masks >= 0)), self._masker_cols), dtype=np.bool)
                 _convert_delta_mask_to_full(masks, full_masks)
-                return self._full_masking_call(full_masks, batch_size=batch_size)
+                return self._full_masking_call(full_masks, batch_size=batch_size, start_row = start_row)
 
         else:
-            return self._full_masking_call(masks, batch_size=batch_size)
+            return self._full_masking_call(masks, batch_size=batch_size, start_row = start_row)
 
-    def _full_masking_call(self, masks, batch_size=None):
+    def _full_masking_call(self, masks, batch_size=None, start_row = 0):
 
         # # TODO: we need to do batching here
         # else:
@@ -169,12 +172,28 @@ class MaskedModel():
     #         self._varying_delta_mask_rows.append(np.unique(np.concatenate(varying_rows_set)))
 
     
-    def _delta_masking_call(self, masks, batch_size=None):
+    def _delta_masking_call(self, masks, batch_size=None, start_row = 0):
         # TODO: we need to do batching here
 
         assert getattr(self.masker, "supports_delta_masking", None) is not None, "Masker must support delta masking!"
         
-        masked_inputs, varying_rows = self.masker(masks, *self.args)
+        if self.mode == 'full':
+            masked_inputs_list=[]
+            varying_rows_list=[]
+            if self.ps_len >= 1:
+                mask_row_count = len(masks) // self.ps_len
+            
+                vx=self.args[0][start_row:start_row+mask_row_count]
+                for row in range(mask_row_count):
+                    row_masked_inputs, row_varying_rows = self.masker(masks[self.ps_len * row : self.ps_len * (row+1)], vx[row])
+                    masked_inputs_list.append(np.array(row_masked_inputs))
+                    varying_rows_list.append(row_varying_rows)
+                masked_inputs=np.concatenate(masked_inputs_list, axis=1)
+                varying_rows=np.array(varying_rows_list)
+                varying_rows=varying_rows.reshape(-1, varying_rows.shape[-1])
+            
+        else:
+            masked_inputs, varying_rows = self.masker(masks, *self.args)
         num_varying_rows = varying_rows.sum(1)
 
         subset_masked_inputs = [arg[varying_rows.reshape(-1)] for arg in masked_inputs]
@@ -218,34 +237,67 @@ class MaskedModel():
         else:
             return np.where(np.any(self._variants, axis=0))[0]
 
-    def main_effects(self, inds=None):
+    def main_effects(self, inds=None, need_interactions=False):
         """ Compute the main effects for this model.
         """
+        def add_pair(pair_dict, inds, iind, iind2, k):
+            k1=inds[iind]
+            k2=inds[iind2]
+            if k1 in pair_dict:
+                pair_dict[k1][k2]=k
+            else:
+                pair_dict[k1]={k2:k}
 
         # if no indexes are given then we assume all indexes could be non-zero
         if inds is None:
             inds = np.arange(len(self))
 
-        # mask each potentially nonzero input in isolation
-        masks = np.zeros(2*len(inds), dtype=np.int)
-        masks[0] = MaskedModel.delta_mask_noop_value
-        last_ind = -1
-        for i in range(len(inds)):
-            if i > 0:
-                masks[2*i] = -last_ind - 1 # turn off the last input
-            masks[2*i+1] = inds[i] # turn on this input
-            last_ind = inds[i]
-
+        k=0 # cournter of index for masks
+        masks = []
+        masks.append(MaskedModel.delta_mask_noop_value)
+        pair_dict={'BASE':{'BASE': k}}
+        
+        # calculate main_effects and interactions a single roll
+        for iind in range(len(inds)):
+            masks.append(inds[iind])
+            k+=1
+            add_pair(pair_dict, inds, iind, iind, k) # this is the main effects for iind
+            if need_interactions:
+                for iind2 in range(iind+1, len(inds)):
+                    masks.append(inds[iind2])
+                    k+=1
+                    add_pair(pair_dict, inds, iind, iind2, k) # this is the interactions between iind and iind2
+                    masks.append(-inds[iind2]-1)
+            masks.append(-inds[iind]-1)
         # compute the main effects for the given indexes
+        masks=np.array(masks, dtype=np.int)
         outputs = self(masks)
-        main_effects = outputs[1:] - outputs[0]
-        
-        # expand the vector to the full input size
-        expanded_main_effects = np.zeros((len(self),) + outputs.shape[1:])
-        for i,ind in enumerate(inds):
-            expanded_main_effects[ind] = main_effects[i]
-        
-        return expanded_main_effects
+        main_effects = []
+        for ind in range(len(self)):
+            main_effects.append(outputs[pair_dict[ind][ind]]) # make up the list of main_effects for features
+        expanded_main_effects=np.array(main_effects) - outputs[0] # make up the main effects output value
+
+        # return main_effects, and interactions if needed
+        if need_interactions:
+            expanded_interactions = np.zeros((len(self),len(self),) + outputs.shape[1:])
+            for i,ind in enumerate(inds):
+                for j,ind2 in enumerate(inds):
+                    if ind != ind2:
+                        d=None
+                        if ind2 in pair_dict[ind]:
+                            d=pair_dict[ind][ind2]
+                        elif ind in pair_dict[ind2]:
+                            d=pair_dict[ind2][ind]
+                        if not (d is None):
+                            if i != j:
+                                itt=(outputs[d] + outputs[0] - outputs[pair_dict[ind][ind]]-outputs[pair_dict[ind2][ind2]])/2
+                                expanded_interactions[ind, ind2] = itt # both are half of the value
+                                expanded_interactions[ind2, ind] = itt # both are half of the value
+                            else:
+                                expanded_interactions[ind, ind2] = expanded_main_effects[ind] # if ind == ind2, the value in the interaction array is the maineffect (of ind (==ind2) )
+            return expanded_main_effects, expanded_interactions
+        else:
+            return expanded_main_effects
 
 def _assert_output_input_match(inputs, outputs):
     assert len(outputs) == len(inputs[0]), \
